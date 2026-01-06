@@ -1,8 +1,9 @@
 use crate::{error::TranslateError, Translator};
 use csv_async::{AsyncReaderBuilder, AsyncWriterBuilder, StringRecord};
-use futures::{stream::FuturesUnordered, StreamExt};
-use std::{path::Path, sync::Arc};
-use tokio::{fs::File, sync::Semaphore};
+use std::path::Path;
+use tokio::fs::File;
+
+const BATCH_SIZE: usize = 128;
 
 pub struct CsvTranslateConfig {
     pub source_col: String,              // e.g. "source"
@@ -28,10 +29,8 @@ pub async fn translate_csv<P: crate::provider::TranslationProvider>(
         .has_headers(true)
         .create_writer(output);
 
-    // Read input headers (stable order)
     let input_headers = rdr.headers().await.map_err(TranslateError::Csv)?.clone();
 
-    // Find source column index
     let source_idx = input_headers
         .iter()
         .position(|h| h == cfg.source_col)
@@ -43,72 +42,76 @@ pub async fn translate_csv<P: crate::provider::TranslationProvider>(
             ))
         })?;
 
-    // Build output headers = input headers + target headers
     let mut output_headers = input_headers.clone();
     for (out_col, _) in &cfg.targets {
         output_headers.push_field(out_col);
     }
 
-    // Write output headers
     wtr.write_record(&output_headers)
         .await
         .map_err(TranslateError::Csv)?;
 
-    let sem = Arc::new(Semaphore::new(cfg.max_concurrency));
+    // -----------------------------
+    // 1) Read all rows into memory
+    // -----------------------------
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
     let mut record = StringRecord::new();
 
-    // Stream records
     while rdr
         .read_record(&mut record)
         .await
         .map_err(TranslateError::Csv)?
     {
-        // Grab source text from the row
-        let source_text = record.get(source_idx).unwrap_or("").to_string();
+        let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+        let source_text = row.get(source_idx).cloned().unwrap_or_default();
 
-        // Translate into each target language concurrently (bounded)
-        let mut futs = FuturesUnordered::new();
-        for (out_col, tgt_lang) in cfg.targets.iter().cloned() {
-            let sem = sem.clone();
-            let src_lang = cfg.src_lang.clone();
-            let text = source_text.clone();
-            let tr = translator;
+        rows.push(row);
+        sources.push(source_text);
+    }
 
-            futs.push(async move {
-                let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                let translated = tr
-                    .translate_batch(&src_lang, &tgt_lang, &[text])
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+    // ---------------------------------------------------
+    // 2) Translate in batches, per target language
+    // ---------------------------------------------------
+    let mut translated_columns: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
-                Ok::<(String, String), TranslateError>((out_col, translated))
-            });
+    for (out_col, tgt_lang) in &cfg.targets {
+        let mut translated_all = Vec::with_capacity(sources.len());
+
+        for chunk in sources.chunks(BATCH_SIZE) {
+            let batch: Vec<String> = chunk.to_vec();
+
+            let translated = translator
+                .translate_batch(&cfg.src_lang, tgt_lang, &batch)
+                .await?;
+
+            if translated.len() != batch.len() {
+                return Err(TranslateError::Provider(format!(
+                    "batch size mismatch: sent {}, got {}",
+                    batch.len(),
+                    translated.len()
+                )));
+            }
+
+            translated_all.extend(translated);
         }
 
-        // Collect translations in the same order as cfg.targets
-        let mut translated_map = std::collections::HashMap::new();
-        while let Some(res) = futs.next().await {
-            let (out_col, translated) = res?;
-            translated_map.insert(out_col, translated);
-        }
+        translated_columns.insert(out_col.clone(), translated_all);
+    }
 
-        // Build output row in correct header order:
-        // start with original row fields
-        let mut out_row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
-
-        // then append target columns in cfg.targets order
+    // ---------------------------------------------------
+    // 3) Write output rows (preserving order)
+    // ---------------------------------------------------
+    for (row_idx, mut row) in rows.into_iter().enumerate() {
         for (out_col, _) in &cfg.targets {
-            out_row.push(
-                translated_map
-                    .get(out_col)
-                    .cloned()
-                    .unwrap_or_else(String::new),
-            );
+            let col_vals = translated_columns
+                .get(out_col)
+                .expect("missing translated column");
+            row.push(col_vals[row_idx].clone());
         }
 
-        wtr.write_record(&out_row)
+        wtr.write_record(&row)
             .await
             .map_err(TranslateError::Csv)?;
     }
@@ -116,3 +119,4 @@ pub async fn translate_csv<P: crate::provider::TranslationProvider>(
     wtr.flush().await.map_err(TranslateError::Io)?;
     Ok(())
 }
+
