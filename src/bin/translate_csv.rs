@@ -1,180 +1,215 @@
-use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+//! CSV Translation CLI
+//!
+//! A command-line tool for translating CSV files into multiple languages.
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Using mock provider (for testing)
+//! translate_csv --input data.csv --output translated.csv
+//!
+//! # Using NLLB REST provider
+//! translate_csv --provider nllb --nllb-url http://localhost:8080 \
+//!     --input data.csv --output translated.csv \
+//!     --target fr=fra_Latn --target es=spa_Latn
+//!
+//! # Custom source column and language
+//! translate_csv --source-col text --src-lang deu_Latn \
+//!     --target en=eng_Latn --input german.csv --output english.csv
+//! ```
+//!
+//! # Providers
+//!
+//! - `mock`: Fake translations for testing (default)
+//! - `nllb`: NLLB REST API server (requires `--nllb-url`)
+//!
+//! # Exit Codes
+//!
+//! - 0: Success
+//! - 1: Error (see stderr for details)
 
+use clap::{Parser, ValueEnum};
+use std::process::ExitCode;
+use std::time::Duration;
 use translator::{
-    csv_pipeline::{translate_csv, CsvTranslateConfig},
-    provider::{mock::MockProvider, nllb_rest::NllbRestProvider},
-    Translator,
+    provider::mock::MockProvider,
+    provider::nllb_rest::NllbRestProvider,
+    translate_csv, CsvTranslateConfig,
 };
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// Available translation providers.
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum ProviderKind {
+    /// Fake translations for testing and development
     Mock,
+    /// NLLB REST API server (requires --nllb-url)
     Nllb,
-    Gemini, // stub for now
 }
 
-#[derive(Debug, Deserialize)]
-struct TargetEntry {
-    col: String,
-    lang: String,
-}
-
+/// Translate a CSV column into multiple languages.
+///
+/// Reads an input CSV, translates the specified source column into each
+/// target language, and writes the output CSV with new translation columns.
 #[derive(Parser, Debug)]
 #[command(name = "translate_csv")]
-#[command(about = "Translate a CSV into multiple language columns", long_about = None)]
+#[command(version)]
+#[command(about = "Translate a CSV column into multiple languages")]
+#[command(long_about = None)]
 struct Args {
     /// Translation provider to use
     #[arg(long, value_enum, default_value_t = ProviderKind::Mock)]
     provider: ProviderKind,
 
-    /// Input CSV path
+    /// Input CSV file path
     #[arg(long, default_value = "input.csv")]
     input: String,
 
-    /// Output CSV path
+    /// Output CSV file path
     #[arg(long, default_value = "output.csv")]
     output: String,
 
-    /// Name of the source column in the CSV
+    /// Name of the column containing source text
     #[arg(long, default_value = "source")]
     source_col: String,
 
-    /// Source language code (FLORES-200 style, e.g. eng_Latn)
+    /// Source language code (e.g., eng_Latn for English)
     #[arg(long, default_value = "eng_Latn")]
     src_lang: String,
 
-    /// Optional JSON file containing targets: [{"col":"fr","lang":"fra_Latn"}, ...]
-    #[arg(long)]
-    targets_file: Option<String>,
-
-    /// Target language mappings in the form: <outputColumn>=<langCode>
-    /// Example: --target fr=fra_Latn --target es=spa_Latn
-    #[arg(long = "target", value_parser = parse_target, num_args = 0..)]
+    /// Target language mappings: COLUMN=LANG_CODE
+    ///
+    /// Examples:
+    ///   --target fr=fra_Latn
+    ///   --target es=spa_Latn
+    ///   --target de=deu_Latn
+    #[arg(long = "target", value_parser = parse_target)]
     targets: Vec<(String, String)>,
 
-    /// Max number of concurrent translation requests
-    #[arg(long, default_value_t = 8)]
-    max_concurrency: usize,
-
-    /// Base URL for NLLB REST server (required when provider=nllb)
+    /// NLLB server URL (required when provider=nllb)
     #[arg(long)]
-    nllb_base_url: Option<String>,
+    nllb_url: Option<String>,
 
-    /// Gemini API key (reserved for future; not implemented yet)
-    #[arg(long)]
-    gemini_api_key: Option<String>,
-
-    /// Request timeout in milliseconds (NLLB)
-    #[arg(long, default_value_t = 60000)]
+    /// Request timeout in milliseconds
+    #[arg(long, default_value_t = 60_000)]
     timeout_ms: u64,
-
-    /// Connect timeout in milliseconds (NLLB)
-    #[arg(long, default_value_t = 5000)]
-    connect_timeout_ms: u64,
-
-    /// Number of retries for transient failures (NLLB)
-    #[arg(long, default_value_t = 3)]
-    retries: usize,
-
-    /// Base backoff in milliseconds (NLLB)
-    #[arg(long, default_value_t = 250)]
-    backoff_ms: u64,
-
-    /// Max backoff cap in milliseconds (NLLB)
-    #[arg(long, default_value_t = 4000)]
-    backoff_cap_ms: u64,
 }
 
+/// Parse "column=lang_code" format.
 fn parse_target(s: &str) -> Result<(String, String), String> {
-    let (left, right) = s
-        .split_once('=')
-        .ok_or_else(|| "target must be in the form <col>=<langCode>, e.g. fr=fra_Latn".to_string())?;
-    let col = left.trim();
-    let lang = right.trim();
-    if col.is_empty() || lang.is_empty() {
-        return Err("target must be in the form <col>=<langCode>, e.g. fr=fra_Latn".to_string());
-    }
-    Ok((col.to_string(), lang.to_string()))
-}
+    let (col, lang) = s.split_once('=').ok_or_else(|| {
+        format!(
+            "Invalid target format: '{}'. Expected COLUMN=LANG_CODE (e.g., fr=fra_Latn)",
+            s
+        )
+    })?;
 
-fn load_targets_file(path: &str) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-    let s = std::fs::read_to_string(path)?;
-    let entries: Vec<TargetEntry> = serde_json::from_str(&s)?;
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let col = e.col.trim();
-        let lang = e.lang.trim();
-        if col.is_empty() || lang.is_empty() {
-            return Err(format!("Invalid entry in targets file: col/lang must be non-empty").into());
-        }
-        out.push((col.to_string(), lang.to_string()));
+    let col = col.trim();
+    let lang = lang.trim();
+
+    if col.is_empty() {
+        return Err("Column name cannot be empty".to_string());
     }
-    Ok(out)
+    if lang.is_empty() {
+        return Err("Language code cannot be empty".to_string());
+    }
+
+    Ok((col.to_owned(), lang.to_owned()))
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     let args = Args::parse();
 
-    // Targets resolution order:
-    // 1) targets loaded from --targets-file (if provided)
-    // 2) plus any repeated --target flags
-    // 3) if still empty, fall back to a small default set
-    let mut targets: Vec<(String, String)> = Vec::new();
-
-    if let Some(path) = &args.targets_file {
-        targets = load_targets_file(path)?;
+    if let Err(e) = run(args).await {
+        eprintln!("Error: {e}");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
+}
 
-    targets.extend(args.targets);
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Default targets if none specified
+    let targets = if args.targets.is_empty() {
+        vec![
+            ("fr".into(), "fra_Latn".into()),
+            ("es".into(), "spa_Latn".into()),
+        ]
+    } else {
+        args.targets
+    };
 
-    if targets.is_empty() {
-        targets = vec![
-            ("fr".to_string(), "fra_Latn".to_string()),
-            ("es".to_string(), "spa_Latn".to_string()),
-            ("de".to_string(), "deu_Latn".to_string()),
-        ];
-    }
-
-    let cfg = CsvTranslateConfig {
+    let config = CsvTranslateConfig {
         source_col: args.source_col,
         src_lang: args.src_lang,
         targets,
-        max_concurrency: args.max_concurrency,
     };
 
     match args.provider {
         ProviderKind::Mock => {
-            let translator = Translator::new(MockProvider::default());
-            translate_csv(&translator, args.input, args.output, cfg).await?;
+            println!("Using mock provider (for testing only)");
+            translate_csv(&MockProvider, &args.input, &args.output, config).await?;
         }
         ProviderKind::Nllb => {
-            use std::time::Duration;
-
-            let base = args.nllb_base_url.ok_or(
-                "Missing --nllb-base-url (example: --nllb-base-url http://localhost:8080)",
+            let url = args.nllb_url.ok_or(
+                "NLLB provider requires --nllb-url. Example: --nllb-url http://localhost:8080"
             )?;
 
-            let nllb = NllbRestProvider::new(base)
-                .with_timeout(Duration::from_millis(args.timeout_ms))
-                .with_connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-                .with_max_retries(args.retries)
-                .with_backoff(
-                    Duration::from_millis(args.backoff_ms),
-                    Duration::from_millis(args.backoff_cap_ms),
-                );
+            println!("Using NLLB provider at {}", url);
 
-            let translator = Translator::new(nllb);
-            translate_csv(&translator, args.input, args.output, cfg).await?;
-        }
+            let provider = NllbRestProvider::new(url)
+                .with_timeout(Duration::from_millis(args.timeout_ms));
 
-        ProviderKind::Gemini => {
-            let _ = args.gemini_api_key;
-            return Err("Gemini provider not implemented yet (stub).".into());
+            translate_csv(&provider, &args.input, &args.output, config).await?;
         }
     }
 
-    println!("Wrote translated CSV successfully.");
+    println!("Translation complete: {} -> {}", args.input, args.output);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_target_accepts_valid_format() {
+        let result = parse_target("fr=fra_Latn");
+        assert!(result.is_ok());
+
+        let (col, lang) = result.unwrap();
+        assert_eq!(col, "fr");
+        assert_eq!(lang, "fra_Latn");
+    }
+
+    #[test]
+    fn parse_target_trims_whitespace() {
+        let result = parse_target("  fr  =  fra_Latn  ");
+        assert!(result.is_ok());
+
+        let (col, lang) = result.unwrap();
+        assert_eq!(col, "fr");
+        assert_eq!(lang, "fra_Latn");
+    }
+
+    #[test]
+    fn parse_target_rejects_missing_equals() {
+        let result = parse_target("fr-fra_Latn");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Expected COLUMN=LANG_CODE"));
+    }
+
+    #[test]
+    fn parse_target_rejects_empty_column() {
+        let result = parse_target("=fra_Latn");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Column name cannot be empty"));
+    }
+
+    #[test]
+    fn parse_target_rejects_empty_language() {
+        let result = parse_target("fr=");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Language code cannot be empty"));
+    }
 }

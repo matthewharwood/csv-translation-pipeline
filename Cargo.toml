@@ -2,22 +2,61 @@
 name = "translator"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
+description = "Async CSV translation pipeline with pluggable providers"
+license = "MIT"
+repository = "https://github.com/yourorg/csv-translation-pipeline"
+keywords = ["translation", "csv", "async", "nllb", "localization"]
+categories = ["command-line-utilities", "text-processing", "internationalization"]
+readme = "README.md"
+
+[[bin]]
+name = "translate_csv"
+path = "src/bin/translate_csv.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# Async runtime - Tokio with multi-threading, filesystem, and timer support
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+
+# CSV processing - Async CSV reading and writing
 csv-async = { version = "1", features = ["tokio"] }
+
+# Serialization - For REST API request/response bodies
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+
+# HTTP client - For REST-based translation providers
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-rand = "0.8"
-thiserror = "1"
-async-trait = "0.1"
-futures = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive"] }
+
+# Utilities
+fastrand = "2"              # Fast random number generation for jitter
+thiserror = "2"             # Ergonomic error type derivation
+clap = { version = "4", features = ["derive"] }  # CLI argument parsing
+uuid = { version = "1", features = ["v4"] }      # Job ID generation
+
+# Optional: MarianMT translation provider (requires libtorch)
+# Enable with: cargo build --features marian
+rust-bert = { version = "0.23", optional = true }
+tch = { version = "0.17", optional = true }
+# Workaround for rust-bert's indicatif dependency issue on macOS
+# See: https://github.com/guillaume-be/rust-bert/issues/486
+console = { version = "0.16", features = ["std"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"   # Async test utilities
+csv = "1"            # Sync CSV for parsing test output
 
 [features]
-default = ["nllb"]
-nllb = []
-gemini = []
+default = []
+
+# MarianMT provider for pure Rust translation without Python.
+# Requires libtorch to be installed. See README for installation instructions.
+#
+# Usage:
+#   cargo build --features marian
+#   cargo test --features marian
+marian = ["rust-bert", "tch", "console"]
+
+[profile.release]
+# Optimize for speed in release builds
+lto = true
+codegen-units = 1
